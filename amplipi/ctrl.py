@@ -84,7 +84,7 @@ class Api:
   _initialized = False # we need to know when we initialized first
   _mock_hw: bool
   _mock_streams: bool
-  _save_timer: Optional[threading.Timer] = None
+  _timers: Dict[str, threading.Timer] = {}
   _delay_saves: bool
   _change_notifier: Optional[Callable[[models.Status], None]] = None
   _rt: Union[rt.Rpi, rt.Mock]
@@ -148,9 +148,12 @@ class Api:
     self._change_notifier = change_notifier
     self._mock_hw = settings.mock_ctrl
     self._mock_streams = settings.mock_streams
-    self._save_timer = None
     self._delay_saves = settings.delay_saves
     self._settings = settings
+    # stop any running timers
+    for timer in self._timers.values():
+      timer.cancel()
+    self._timers = {}
 
     # Create firmware interface. If one already exists delete then re-init.
     if self._initialized:
@@ -249,11 +252,13 @@ class Api:
     # configure all of the groups (some fields may need to be updated)
     self._update_groups()
 
+    self._watch_changes()
+
   def __del__(self):
-    # stop save in the future so we can save right away
-    if self._save_timer:
-      self._save_timer.cancel()
-      self._save_timer = None
+    # stop any running timers (stops the future save as well)
+    for timer in self._timers.values():
+      timer.cancel()
+    # make sure to save state
     self.save()
 
   def save(self) -> None:
@@ -275,15 +280,15 @@ class Api:
 
     This attempts to avoid excessive saving and the resulting delays by only saving a small delay after the last change
     """
-    if self._change_notifier:
-      self._change_notifier(self.get_state())
     if self._delay_saves:
-      if self._save_timer:
-        self._save_timer.cancel()
-        self._save_timer = None
+      save_timer = self._timers.get('save')
+      if save_timer:
+        save_timer.cancel()
+        del save_timer
       # start can only be called once on a thread
-      self._save_timer = threading.Timer(5.0, self.save)
-      self._save_timer.start()
+      save_timer = threading.Timer(5.0, self.save)
+      save_timer.start()
+      self._timers['save'] = save_timer
     else:
       self.save()
 
@@ -312,14 +317,12 @@ class Api:
       inputs['stream={}'.format(stream.id)] = f'{stream.name} - {stream.type}'
     return inputs
 
-  def get_state(self) -> models.Status:
-    """ get the system state """
+  def _watch_changes(self):
     # update the state with the latest stream info
-    # TODO: figure out how to cache stream info
     optional_fields = ['station', 'user', 'password', 'url', 'logo', 'freq', 'token', 'client_id'] # optional configuration fields
     streams = []
     for sid, stream_inst in self.streams.items():
-      # TODO: this functionality should be in the unimplemented streams base class
+      # TODO: this functionality should be in the streams base class
       # convert the stream instance info to stream data (serialize its current configuration)
       st_type = type(stream_inst).__name__.lower()
       stream = models.Stream(id=sid, name=stream_inst.name, type=st_type)
@@ -329,9 +332,26 @@ class Api:
       streams.append(stream)
     self.status.streams = streams
     # update source's info
-    # TODO: stream/source info should be updated in a background thread
     for src in self.status.sources:
       self._update_src_info(src)
+
+    if self._change_notifier:
+      # TODO: Diff against the last status and only send that as a notification
+      # TODO: Don't even send on no change
+      self._change_notifier(self.status)
+
+    # Let's check for changes again
+    update_timer = self._timers.get('update')
+    if update_timer:
+      update_timer.cancel()
+      del update_timer
+    # start can only be called once on a thread
+    update_timer = threading.Timer(1.0, self._watch_changes)
+    update_timer.start()
+    self._timers['update'] = update_timer
+
+  def get_state(self) -> models.Status:
+    """ get the system state """
     return self.status
 
   def get_items(self, tag: str) -> Optional[List[models.Base]]:
