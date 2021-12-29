@@ -819,6 +819,11 @@ class Status(BaseModel):
       },
     }
 
+class StatusUpdate(BaseModel):
+  sources: Optional[List[SourceUpdateWithId]]
+  zones: Optional[List[ZoneUpdateWithId]]
+  groups: Optional[List[GroupUpdateWithId]]
+
 class AppSettings(BaseSettings):
   """ Controller settings """
   mock_ctrl: bool = True

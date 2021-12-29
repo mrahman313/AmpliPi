@@ -336,9 +336,10 @@ class Api:
       self._update_src_info(src)
 
     if self._change_notifier:
-      # TODO: Diff against the last status and only send that as a notification
-      # TODO: Don't even send on no change
-      self._change_notifier(self.status)
+      changes = models.StatusUpdate()
+      # TODO: construct a Status update from the changed stack
+      # TODO: some changes will need a full update, like deleting or adding streams or groups
+      self._change_notifier(changes)
 
     # Let's check for changes again
     update_timer = self._timers.get('update')
@@ -414,6 +415,7 @@ class Api:
     if idx is not None and src is not None:
       name, _ = utils.updated_val(update.name, src.name)
       input_, input_updated = utils.updated_val(update.input, src.input)
+      # TODO: add to stack if name or input changed
       try:
         # update the name
         src.name = str(name)
@@ -517,6 +519,8 @@ class Api:
         except Exception as exc:
           return ApiResponse.error(str(exc))
 
+        # TODO: add to update stack on any change or force update
+
         if not internal:
           # update the group stats (individual zone volumes, sources, and mute configuration can effect a group)
           self._update_groups()
@@ -595,6 +599,8 @@ class Api:
     group.name = name
     group.zones = zones
 
+    # TODO: add to update stack on name or zone change
+
     # update each of the member zones
     zone_update = models.ZoneUpdate(source_id=update.source_id, mute=update.mute)
     if vol_change != 0:
@@ -604,7 +610,7 @@ class Api:
       self.set_zone(zone.id, zone_update, internal=True)
 
     # save the volume
-    group.vol_delta = vol_delta
+    group.vol_delta = vol_delta # TODO: this should probably be removed since it will happing in update_groups
 
     if not internal:
       # update the group stats
