@@ -27,6 +27,7 @@ from enum import Enum
 from copy import deepcopy
 import os # files
 import time
+from queue import Queue # changes
 
 import threading
 import wrapt
@@ -76,6 +77,48 @@ class ApiResponse:
   OK = ApiCode.OK
   ERROR = ApiCode.ERROR
 
+class Changes():
+  """ Keep track of partial changes to the API """
+
+  CATEGORIES = ['groups', 'presets', 'sources', 'streams', 'zones']
+
+  def __init__(self):
+    self._changes : Dict[str, Set] = {t: set() for t in self.CATEGORIES}
+    self._needs_full_update = False
+
+  def mark_add(self, typ: str, id: int) -> None:
+    """ Mark a creation """
+    self._needs_full_update = True
+
+  def mark_del(self, typ: str, id: int) -> None:
+    """ Mark a deletion """
+    self._needs_full_update = True
+
+  def mark_mod(self, typ: str, id: int) -> None:
+    """ Mark a modification """
+    self._changes[typ].add(id)
+
+  def mark_all(self):
+    """ Mark changes to everthing
+
+    This is typically used for a reset """
+    self._needs_full_update = True
+
+  def get_update(self, status: models.Status) -> models.StatusUpdate:
+    update = models.StatusUpdate()
+    if self._needs_full_update:
+      for category in self.CATEGORIES:
+        cat_updates = [elem for elem in status.__dict__[category]]
+        update.__dict__[category] = cat_updates
+    else:
+      for category in self.CATEGORIES:
+        changes = self._changes[category]
+        if len(changes) == 0:
+          continue
+        cat_updates = [elem for elem in status.__dict__[category] if elem.id in changes]
+        update.__dict__[category] = cat_updates
+    return update
+
 class Api:
   """ Amplipi Controller API"""
   # pylint: disable=too-many-instance-attributes
@@ -86,7 +129,8 @@ class Api:
   _mock_streams: bool
   _timers: Dict[str, threading.Timer] = {}
   _delay_saves: bool
-  _change_notifier: Optional[Callable[[models.Status], None]] = None
+  _changes = Changes()
+  _change_notifier: Optional[Callable[[models.StatusUpdate], None]] = None
   _rt: Union[rt.Rpi, rt.Mock]
   config_file: str
   backup_config_file: str
@@ -137,11 +181,11 @@ class Api:
   # TODO: migrate to init setting instance vars to a disconnected state (API requests will throw Api.DisconnectedException() in this state
   # with this reinit will be called connect and will attempt to load the configutation and connect to an AmpliPi (mocked or real)
   # returning a boolean on whether or not it was successful
-  def __init__(self, settings: models.AppSettings = models.AppSettings(), change_notifier: Optional[Callable[[models.Status], None]] = None):
+  def __init__(self, settings: models.AppSettings = models.AppSettings(), change_notifier: Optional[Callable[[models.StatusUpdate], None]] = None):
     self.reinit(settings, change_notifier)
     self._initialized = True
 
-  def reinit(self, settings: models.AppSettings = models.AppSettings(), change_notifier: Optional[Callable[[models.Status], None]] = None, config: Optional[models.Status] = None):
+  def reinit(self, settings: models.AppSettings = models.AppSettings(), change_notifier: Optional[Callable[[models.StatusUpdate], None]] = None, config: Optional[models.Status] = None):
     """ Initialize or Reinitialize the controller
 
     Intitializes the system to to base configuration """
@@ -318,10 +362,13 @@ class Api:
     return inputs
 
   def _watch_changes(self):
+    # TODO: make these stream updates send change updates, but only check for changes when changes are empty or we are ready to sync
+    # the goal: don't push updates when the system is in flux
     # update the state with the latest stream info
     optional_fields = ['station', 'user', 'password', 'url', 'logo', 'freq', 'token', 'client_id'] # optional configuration fields
     streams = []
     for sid, stream_inst in self.streams.items():
+      # TODO: we should only update a stream if it has been changed, we should be able to inspect the change queue to handle this
       # TODO: this functionality should be in the streams base class
       # convert the stream instance info to stream data (serialize its current configuration)
       st_type = type(stream_inst).__name__.lower()
@@ -335,11 +382,8 @@ class Api:
     for src in self.status.sources:
       self._update_src_info(src)
 
-    if self._change_notifier:
-      changes = models.StatusUpdate()
-      # TODO: construct a Status update from the changed stack
-      # TODO: some changes will need a full update, like deleting or adding streams or groups
-      self._change_notifier(changes)
+    if self._change_notifier and self._changes.has_update():
+      self._change_notifier(self._changes.get_update(status))
 
     # Let's check for changes again
     update_timer = self._timers.get('update')
@@ -413,12 +457,9 @@ class Api:
     """
     idx, src = utils.find(self.status.sources, sid)
     if idx is not None and src is not None:
-      name, _ = utils.updated_val(update.name, src.name)
+      name, name_updated = utils.updated_val(update.name, src.name)
       input_, input_updated = utils.updated_val(update.input, src.input)
-      # TODO: add to stack if name or input changed
       try:
-        # update the name
-        src.name = str(name)
         if input_updated or force_update:
           # shutdown old stream
           old_stream = self.get_stream(src)
@@ -443,9 +484,14 @@ class Api:
             # update this source
             src_cfg[idx] = self._is_digital(input_)
             if not self._rt.update_sources(src_cfg):
+              src.input = last_input
               return ApiResponse.error('failed to set source')
           self._update_src_info(src) # synchronize the source's info
-        if not internal:
+        # update the name, last to avoid inconsistencies from failure
+        src.name = str(name)
+        if name_updated or input_updated:
+          self._changes.mark_mod('sources', sid)
+        if not internal: # TODO: remove old change handling
           self.mark_changes()
         return ApiResponse.ok()
       except Exception as exc:
@@ -466,18 +512,15 @@ class Api:
     """
     idx, zone = utils.find(self.status.zones, zid)
     if idx is not None and zone is not None:
-      name, _ = utils.updated_val(update.name, zone.name)
+      name, update_name = utils.updated_val(update.name, zone.name)
       source_id, update_source_id = utils.updated_val(update.source_id, zone.source_id)
       mute, update_mutes = utils.updated_val(update.mute, zone.mute)
       vol, update_vol = utils.updated_val(update.vol, zone.vol)
-      disabled, _ = utils.updated_val(update.disabled, zone.disabled)
+      disabled, update_disabled = utils.updated_val(update.disabled, zone.disabled)
       try:
         sid = utils.parse_int(source_id, [0, 1, 2, 3])
         vol = utils.parse_int(vol, range(models.MIN_VOL, -models.MIN_VOL)) # hold additional state for group delta volume adjustments, output volume will be saturated to 0dB
         zones = self.status.zones
-        # update non hw state
-        zone.name = name
-        zone.disabled = disabled
         if update_source_id or force_update:
           zone_sources = [zone.source_id for zone in zones]
           zone_sources[idx] = sid
@@ -519,12 +562,18 @@ class Api:
         except Exception as exc:
           return ApiResponse.error(str(exc))
 
-        # TODO: add to update stack on any change or force update
-
+        # update non hw state after failures to avoid inconsistencies
+        zone.name = name
+        zone.disabled = disabled
+        # mark our changes
+        updated = True in [update_name, update_source_id, update_mutes, update_vol, update_disabled]
+        if updated or force_update:
+          self._changes.mark_mod('zones', zid)
         if not internal:
           # update the group stats (individual zone volumes, sources, and mute configuration can effect a group)
           self._update_groups()
-          self.mark_changes()
+          self.mark_changes() # TODO: remove old change handling
+          self._changes.sync()
 
         return ApiResponse.ok()
       except Exception as exc:
@@ -556,22 +605,34 @@ class Api:
       # update the group stats (individual zone volumes, sources, and mute configuration can effect a group)
       self._update_groups()
       self.mark_changes()
+      self._changes.sync()
     return resp
 
   def _update_groups(self) -> None:
     """Updates the group's aggregate fields to maintain consistency and simplify app interface"""
     for group in self.status.groups:
+      changed = False
       zones = [self.status.zones[z] for z in group.zones]
       mutes = [z.mute for z in zones]
       sources = {z.source_id for z in zones}
       vols = [z.vol for z in zones]
       vols.sort()
-      group.mute = False not in mutes # group is only considered muted if all zones are muted
+      mute = False not in mutes # group is only considered muted if all zones are muted
+      if mute != group.mute:
+        group.mute = mute
+        changed = True
+      source_id = None # assume multiple sources
       if len(sources) == 1:
-        group.source_id = sources.pop() # TODO: how should we handle different sources in the group?
-      else: # multiple sources
-        group.source_id = None
-      group.vol_delta = (vols[0] + vols[-1]) // 2 # group volume is the midpoint between the highest and lowest source
+        source_id = sources.pop() # TODO: how should we handle different sources in the group?
+      if source_id != group.source_id:
+        group.source_id = source_id
+        changed = True
+      vol_delta = (vols[0] + vols[-1]) // 2 # group volume is the midpoint between the highest and lowest source
+      if vol_delta != group.vol_delta:
+        group.vol_delta = vol_delta
+        changed = True
+      if changed and group.id is not None:
+        self._changes.mark_mod('groups', group.id)
 
   def set_group(self, gid, update: models.GroupUpdate, internal: bool = False) -> ApiResponse:
     """Configures an existing group
@@ -588,8 +649,8 @@ class Api:
     _, group = utils.find(self.status.groups, gid)
     if group is None:
       return ApiResponse.error('set group failed, group {} not found'.format(gid))
-    name, _ = utils.updated_val(update.name, group.name)
-    zones, _ = utils.updated_val(update.zones, group.zones)
+    name, updated_name = utils.updated_val(update.name, group.name)
+    zones, updated_zones = utils.updated_val(update.zones, group.zones)
     vol_delta, vol_updated = utils.updated_val(update.vol_delta, group.vol_delta)
     if vol_updated and (group.vol_delta is not None and vol_delta is not None):
       vol_change = vol_delta - group.vol_delta
@@ -599,7 +660,8 @@ class Api:
     group.name = name
     group.zones = zones
 
-    # TODO: add to update stack on name or zone change
+    if updated_name or updated_zones:
+      self._changes.mark_mod('groups', gid)
 
     # update each of the member zones
     zone_update = models.ZoneUpdate(source_id=update.source_id, mute=update.mute)
@@ -616,12 +678,15 @@ class Api:
       # update the group stats
       self._update_groups()
       self.mark_changes()
+      self._changes.sync()
 
     return ApiResponse.ok()
 
   def _new_group_id(self):
     """ get next available group id """
     return utils.next_available_id(self.status.groups, default=100)
+
+# TODO: below here still needs to have changes integrated!!
 
   def create_group(self, group: models.Group) -> models.Group:
     """Creates a new group with a list of zones

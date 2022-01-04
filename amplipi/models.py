@@ -34,6 +34,8 @@ from pydantic import BaseSettings, BaseModel, Field
 MIN_VOL = -80
 MAX_VOL = 0
 
+# TODO: use the concept of mixins to make ID and ID-less types and separate different update concepts
+
 class fields(SimpleNamespace):
   """ AmpliPi's field types """
   ID = Field(description='Unique identifier')
@@ -820,9 +822,13 @@ class Status(BaseModel):
     }
 
 class StatusUpdate(BaseModel):
-  sources: Optional[List[SourceUpdateWithId]]
-  zones: Optional[List[ZoneUpdateWithId]]
+  full_update: bool = Field(default=False, description='Is update partial or full? '
+  'A full update is needed when something is deleted')
   groups: Optional[List[GroupUpdateWithId]]
+  presets: Optional[List[PresetUpdate]]
+  sources: Optional[List[SourceUpdateWithId]]
+  streams: Optional[List[Stream]]
+  zones: Optional[List[ZoneUpdateWithId]]
 
 class AppSettings(BaseSettings):
   """ Controller settings """
