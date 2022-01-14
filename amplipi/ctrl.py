@@ -80,19 +80,20 @@ class ApiResponse:
 class Changes():
   """ Keep track of partial changes to the API """
 
-  CATEGORIES = ['groups', 'presets', 'sources', 'streams', 'zones']
+  CATEGORIES = frozenset(['groups', 'presets', 'sources', 'streams', 'zones'])
 
-  def __init__(self):
-    self._changes : Dict[str, Set] = {t: set() for t in self.CATEGORIES}
-    self._needs_full_update = False
+  def __init__(self,  notifier: Optional[Callable[[models.StatusUpdate], None]] = None):
+    self._changes : Dict[str, Set] = {t: set() for t in Changes.CATEGORIES}
+    self._notifier = notifier
+    self._synced_changes : List[Dict[str, Set]] = []
 
   def mark_add(self, typ: str, id: int) -> None:
     """ Mark a creation """
-    self._needs_full_update = True
+    self.mark_all()
 
   def mark_del(self, typ: str, id: int) -> None:
     """ Mark a deletion """
-    self._needs_full_update = True
+    self.mark_all()
 
   def mark_mod(self, typ: str, id: int) -> None:
     """ Mark a modification """
@@ -102,22 +103,44 @@ class Changes():
     """ Mark changes to everthing
 
     This is typically used for a reset """
-    self._needs_full_update = True
+    self._changes['needs_full_update'] = frozenset()
 
-  def get_update(self, status: models.Status) -> models.StatusUpdate:
-    update = models.StatusUpdate()
-    if self._needs_full_update:
-      for category in self.CATEGORIES:
-        cat_updates = [elem for elem in status.__dict__[category]]
-        update.__dict__[category] = cat_updates
+  def sync(self) -> None:
+    """ Synchronize new changes allowing a set of small change to be treated as an update """
+    changes = self._changes
+    self._changes = {t: set() for t in Changes.CATEGORIES}
+    self._synced_changes.append(changes)
+
+  @staticmethod
+  def changes_to_update(all_changes: List[Dict[str, Set]], status: models.Status) -> models.StatusUpdate:
+    needs_full_update = True in ['needs_full_update' in c for c in all_changes]
+    if needs_full_update:
+      return status.as_update()
     else:
-      for category in self.CATEGORIES:
-        changes = self._changes[category]
-        if len(changes) == 0:
-          continue
-        cat_updates = [elem for elem in status.__dict__[category] if elem.id in changes]
-        update.__dict__[category] = cat_updates
-    return update
+      update = models.StatusUpdate()
+      for category in Changes.CATEGORIES:
+        changes: Set = set().union(*[c[category] for c in all_changes])
+        if len(changes) > 0:
+          cat_updates = [elem for elem in status.__dict__[category] if elem.id in changes]
+          update.__dict__[category] = cat_updates
+      return update
+
+  def update_ready(self):
+    in_progress_changes = 0
+    for changes in self._changes:
+      in_progress_changes += len(changes)
+    return len(self._synced_changes) > 0 and in_progress_changes == 0
+
+  def post_update(self, status: models.Status):
+    if not self.update_ready():
+      update = status.as_update()
+    else:
+      changes = self._synced_changes
+      self._synced_changes = []
+      update = self.changes_to_update(changes, status)
+    # we discard the updates to they don't build up without a notifier
+    if self._notifier is not None:
+      self._notifier(update)
 
 class Api:
   """ Amplipi Controller API"""
@@ -130,7 +153,6 @@ class Api:
   _timers: Dict[str, threading.Timer] = {}
   _delay_saves: bool
   _changes = Changes()
-  _change_notifier: Optional[Callable[[models.StatusUpdate], None]] = None
   _rt: Union[rt.Rpi, rt.Mock]
   config_file: str
   backup_config_file: str
@@ -189,7 +211,7 @@ class Api:
     """ Initialize or Reinitialize the controller
 
     Intitializes the system to to base configuration """
-    self._change_notifier = change_notifier
+    self._changes._notifier = change_notifier
     self._mock_hw = settings.mock_ctrl
     self._mock_streams = settings.mock_streams
     self._delay_saves = settings.delay_saves
@@ -382,8 +404,8 @@ class Api:
     for src in self.status.sources:
       self._update_src_info(src)
 
-    if self._change_notifier and self._changes.has_update():
-      self._change_notifier(self._changes.get_update(status))
+    if self._changes.update_ready():
+      self._changes.post_update(self.status)
 
     # Let's check for changes again
     update_timer = self._timers.get('update')
@@ -432,9 +454,10 @@ class Api:
       return self.streams.get(idx, None)
     return None
 
-  def _update_src_info(self, src):
+  def _update_src_info(self, src) -> None:
     """ Update a source's status and song metadata """
     stream_inst = self.get_stream(src)
+    old_info = src.info
     if stream_inst is not None:
       src.info = stream_inst.info()
     elif src.input == 'local' and src.id is not None:
@@ -442,6 +465,8 @@ class Api:
       src.info = models.SourceInfo(img_url='static/imgs/rca_inputs.svg', name=f'{src.name} - rca', state='unknown')
     else:
       src.info = models.SourceInfo(img_url='static/imgs/disconnected.png', name='None', state='stopped')
+    if old_info != src.info and src.id is not None:
+      self._changes.mark_mod('sources', src.id)
 
   def set_source(self, sid: int, update: models.SourceUpdate, force_update: bool = False, internal: bool = False) -> ApiResponse:
     """Modifes the configuration of one of the 4 system sources
@@ -709,6 +734,8 @@ class Api:
     self._update_groups()
 
     self.mark_changes()
+    self._changes.mark_add('groups', group.id)
+    self._changes.sync()
     return group
 
   @save_on_success
@@ -718,6 +745,8 @@ class Api:
       i, _ = utils.find(self.status.groups, gid)
       if i is not None:
         del self.status.groups[i]
+        self._changes.mark_del('groups', gid)
+        self._changes.sync()
         return ApiResponse.ok()
       return ApiResponse.error('delete group failed: {} does not exist'.format(gid))
     except KeyError:
@@ -739,7 +768,9 @@ class Api:
       # Use get state to populate the contents of the newly created stream and find it in the stream list
       _, new_stream = utils.find(self.get_state().streams, sid)
       if new_stream:
+        self._changes.mark_add('streams', sid)
         if not internal:
+          self._changes.sync()
           self.mark_changes()
         return new_stream
       return ApiResponse.error('create stream failed: no stream created')
@@ -758,6 +789,9 @@ class Api:
     try:
       changes = update.dict(exclude_none=True)
       stream.reconfig(**changes)
+      self._changes.mark_mod('streams', sid)
+      self._changes.sync()
+      self.mark_changes()
       return ApiResponse.ok()
     except Exception as exc:
       return ApiResponse.error('Unable to reconfigure stream {}: {}'.format(sid, exc))
@@ -774,7 +808,9 @@ class Api:
       i, _ = utils.find(self.status.streams, sid)
       if i is not None:
         del self.status.streams[i] # delete the cached stream state just in case
+        self._changes.mark_mod('streams', sid)
       if not internal:
+        self._changes.sync()
         self.mark_changes()
       return ApiResponse.ok()
     except KeyError:
@@ -841,7 +877,9 @@ class Api:
       preset.id = pid
       preset.last_used = None # indicates this preset has never been used
       self.status.presets.append(preset)
+      self._changes.mark_add('presets', pid)
       if not internal:
+        self._changes.sync()
         self.mark_changes()
       return preset
     except Exception as exc:
@@ -859,6 +897,8 @@ class Api:
       # TODO: validate preset
       for field in changes.keys():
         preset.__dict__[field] = update.__dict__[field]
+      self._changes.mark_mod('presets', pid)
+      self._changes.sync()
       return ApiResponse.ok()
     except Exception as exc:
       return ApiResponse.error('Unable to reconfigure preset {}: {}'.format(pid, exc))
@@ -870,6 +910,8 @@ class Api:
       idx, _ = utils.find(self.status.presets, pid)
       if idx is not None:
         del self.status.presets[idx] # delete the cached preset state just in case
+        self._changes.mark_del('presets', pid)
+        self._changes.sync()
         return ApiResponse.ok()
       return ApiResponse.error('delete preset failed: {} does not exist'.format(pid))
     except KeyError:
@@ -986,8 +1028,10 @@ class Api:
     )
     if last_pid is None:
       self.status.presets.append(last_config)
+      self._changes.mark_add('presets', self._LAST_PRESET_ID)
     else:
       self.status.presets[last_pid] = last_config
+      self._changes.mark_mod('presets', self._LAST_PRESET_ID)
 
     if preset.state is not None:
       try:
@@ -998,6 +1042,10 @@ class Api:
     # TODO: execute stream commands
 
     preset.last_used = int(time.time())
+
+    if not internal:
+      self._changes.sync()
+      self.mark_changes()
 
     # TODO: release lock
     return ApiResponse.ok()
@@ -1040,5 +1088,6 @@ class Api:
     resp5 = self.delete_stream(stream.id, internal=True) # remember to delete the temporary stream
     if resp5.code != ApiCode.OK:
       return resp5
+    self._changes.sync()
     self.mark_changes()
     return resp4
