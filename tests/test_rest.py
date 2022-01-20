@@ -110,7 +110,8 @@ def client(request):
   app = amplipi.app.create_app(mock_ctrl=True, mock_streams=True, config_file=config_file, delay_saves=False)
   c = TestClient(app)
   c.original_config = deepcopy(cfg) # add the loaded config so we can remember what was loaded
-  return c
+  yield c
+  amplipi.app.get_ctrl().shutdown()
 
 @pytest.fixture(params=[base_config_copy(), base_config_no_presets(), base_config_no_groups()])
 def clientnm(request):# Non-mock systems should use this client - mock_ctrl and mock_streams are False here
@@ -123,7 +124,8 @@ def clientnm(request):# Non-mock systems should use this client - mock_ctrl and 
   app = amplipi.app.create_app(mock_ctrl=False, mock_streams=False, config_file=config_file, delay_saves=False)
   c = TestClient(app)
   c.original_config = deepcopy(cfg) # add the loaded config so we can remember what was loaded
-  return c
+  yield c
+  amplipi.app.get_ctrl().shutdown()
 
 # TODO: the web view test should be added to its own testfile once we add more functionality to the site
 @pytest.mark.parametrize('path', ['' , '/'] + [ '/{}'.format(i) for i in range(4) ])
