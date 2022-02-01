@@ -1,4 +1,7 @@
-#! /usr/bin/python3
+#!/usr/bin/python3 # TODO: make this use venv
+
+""" Play internet radio stations using vlc (or similar streaming urls) """
+
 # -*- coding: utf-8 -*-
 
 # Use libvlc to play internetradio stations to a specific alsa output
@@ -29,6 +32,8 @@ import time
 import json
 import vlc
 import argparse
+from dataclasses import dataclass
+from typing import Optional
 
 parser = argparse.ArgumentParser(prog='runvlc', description='play an internet radio station using vlc')
 parser.add_argument('url', type=str, help='internet radio station url')
@@ -85,25 +90,24 @@ if args.song_info:
 time.sleep(2)
 
 # Keep track of the current state so we only update on change
-cur_url = ''
-cur_info = {
-  'track':'',
-  'artist':'',
-  'station': '',
-  'state': 'stopped',
-}
+@dataclass
+class SongInfo(object):
+  url = Optional[str] = None
+  track: Optional[str] = None
+  artist: Optional[str] = None
+  station: Optional[str] = None
+  state: str = 'stopped'
+
+
+cur_info = SongInfo()
 
 # Monitor track meta data and update currently_playing file if the track changed
 while True:
   try:
     if str(player.get_state()) == 'State.Playing':
 
-      latest_info = {
-        'track':'',
-        'artist':'',
-        'station': '',
-        'state': 'playing',
-      }
+      latest_info = SongInfo()
+      lasest_info.state = 'playing'
 
       if args.verbose:
         print(f"""vlc metadata:
