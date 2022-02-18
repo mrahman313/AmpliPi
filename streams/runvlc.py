@@ -75,7 +75,7 @@ try:
   player.play()
 except Exception:
   log(sys.exc_info())
-  exit(1)
+  sys.exit(1)
 
 if args.song_info:
   try:
@@ -92,7 +92,7 @@ time.sleep(2)
 # Keep track of the current state so we only update on change
 @dataclass
 class SongInfo(object):
-  url = Optional[str] = None
+  url: Optional[str] = None
   track: Optional[str] = None
   artist: Optional[str] = None
   station: Optional[str] = None
@@ -106,8 +106,7 @@ while True:
   try:
     if str(player.get_state()) == 'State.Playing':
 
-      latest_info = SongInfo()
-      lasest_info.state = 'playing'
+      latest_info = SongInfo(state = 'playing')
 
       if args.verbose:
         print(f"""vlc metadata:
@@ -119,7 +118,7 @@ while True:
         """)
 
       # Pass along the station name if it exists in Title metadata
-      latest_info['station'] = media.get_meta(vlc.Meta.Title)
+      latest_info.station = media.get_meta(vlc.Meta.Title)
 
       # 'nowplaying' metadata is used by some internet radio stations instead of separate artist and title
       nowplaying = media.get_meta(vlc.Meta.NowPlaying)
@@ -128,20 +127,20 @@ while True:
         # 'nowplaying' metadata is "almost" always: title - artist
         if '-' in nowplaying:
           parts = nowplaying.split(' - ', 1)
-          latest_info['artist'] = parts[0]
-          latest_info['track'] = parts[1]
+          latest_info.artist = parts[0]
+          latest_info.track = parts[1]
         else:
-          latest_info['artist'] = None
-          latest_info['track'] = nowplaying
+          latest_info.artist = None
+          latest_info.track = nowplaying
       else:
-        latest_info['artist'] = media.get_meta(vlc.Meta.Artist)
-        latest_info['track'] = media.get_meta(vlc.Meta.Title)
+        latest_info.artist = media.get_meta(vlc.Meta.Artist)
+        latest_info.track = media.get_meta(vlc.Meta.Title)
 
       # Update currently_playing file if the track has changed
-      if cur_info != latest_info or cur_url != vlc.bytes_to_str(media.get_mrl()):
+      if cur_info != latest_info or cur_info.url != vlc.bytes_to_str(media.get_mrl()):
         cur_info = latest_info
-        cur_url = vlc.bytes_to_str(media.get_mrl())
-        log(f"Current track: {latest_info['track']} - {latest_info['artist']}")
+        cur_info.url = vlc.bytes_to_str(media.get_mrl())
+        log(f"Current track: {latest_info.track} - {latest_info.artist}")
 
         if args.test:
           log('success')
